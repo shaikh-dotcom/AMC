@@ -4,57 +4,156 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 from hybrid_model_cbn import HybridAMCNet
 
+# Configuration
+BATCH_SIZE = 256
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}\n")
 
-with open('RML2016.10b.dat', 'rb') as f:  # match your filename
-    data_10b = pickle.load(f, encoding='latin1')
 
-split = torch.load('amc_data_split.pt', weights_only=False)
-mods_train = split['mods']
+# ============================================================
+# Load RadioML2016.10b & Class Mapping
+# ============================================================
+
+with open("RML2016.10b.dat", "rb") as f:
+    data_10b = pickle.load(f, encoding="latin1")
+
+split = torch.load("amc_data_split.pt", weights_only=False)
+
+mods_train = split["mods"]
 mod_to_idx = {m: i for i, m in enumerate(mods_train)}
-amssb_idx = mod_to_idx['AM-SSB']  # the structurally-irrelevant class here
+amssb_idx = mod_to_idx["AM-SSB"]
 
 mods_10b = sorted(set(k[0] for k in data_10b.keys()))
-X_list, y_list, snr_list = [], [], []
+dropped = [m for m in mods_10b if m not in mod_to_idx]
+
+print(f"Dropped (not in training set): {dropped}\n")
+
+
+# ============================================================
+# Build Evaluation Tensors (Includes IQ Shape Correction)
+# ============================================================
+
+X_list = []
+y_list = []
+snr_list = []
+
 for (mod, snr), signals in data_10b.items():
     if mod not in mod_to_idx:
         continue
+
     for sig in signals:
-        X_list.append(sig)
+        sig_arr = np.array(sig, dtype=np.float32)
+
+        # Transpose (128, 2) to (2, 128) if necessary for the PyTorch model
+        if sig_arr.shape == (128, 2):
+            sig_arr = sig_arr.T
+
+        X_list.append(sig_arr)
         y_list.append(mod_to_idx[mod])
         snr_list.append(snr)
+
 
 X_10b = torch.tensor(np.array(X_list), dtype=torch.float32)
 y_10b = torch.tensor(y_list, dtype=torch.long)
 snr_10b = np.array(snr_list)
 
-model = HybridAMCNet(num_classes=len(mods_train), num_subbands=8,
-                      stem_channels=32, input_length=128).to(device)
-model.load_state_dict(torch.load('hybrid_cbn_final.pt', weights_only=True))
+print(f"Total 2016.10b eval samples: {X_10b.shape[0]} (Tensor shape: {list(X_10b.shape)})\n")
+
+
+# ============================================================
+# Load HybridAMCNet + ComplexBN Model
+# ============================================================
+
+model = HybridAMCNet(
+    num_classes=len(mods_train),
+    num_subbands=8,
+    stem_channels=32,
+    input_length=128
+).to(device)
+
+model.load_state_dict(
+    torch.load("hybrid_cbn_final.pt", weights_only=True)
+)
 model.eval()
 
-loader = DataLoader(TensorDataset(X_10b, y_10b), batch_size=256, shuffle=False)
+params = sum(p.numel() for p in model.parameters())
+print(f"HybridAMCNet+ComplexBN parameters: {params:,}")
+print("Loaded: hybrid_cbn_final.pt\n")
 
-correct_unrestricted, correct_restricted, total = 0, 0, 0
-snr_correct_u, snr_correct_r, snr_total = {}, {}, {}
+
+# ============================================================
+# DataLoader & Inference Loop
+# ============================================================
+
+loader = DataLoader(
+    TensorDataset(X_10b, y_10b),
+    batch_size=BATCH_SIZE,
+    shuffle=False
+)
+
+correct_u = 0
+correct_r = 0
+total = 0
+
+snr_correct_r = {}
+snr_total = {}
 
 with torch.no_grad():
-    for X_batch, y_batch in loader:
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+    for i, (X_batch, y_batch) in enumerate(loader):
+        X_batch = X_batch.to(device)
+        y_batch = y_batch.to(device)
+
+        # Forward Pass
         logits = model(X_batch)
 
-        preds_unrestricted = logits.argmax(dim=1)
+        # Unrestricted Predictions
+        preds_u = logits.argmax(dim=1)
 
+        # Restricted Predictions (AM-SSB Masked)
         logits_masked = logits.clone()
-        logits_masked[:, amssb_idx] = float('-inf')  # AM-SSB is not a valid choice here
-        preds_restricted = logits_masked.argmax(dim=1)
+        logits_masked[:, amssb_idx] = float("-inf")
+        preds_r = logits_masked.argmax(dim=1)
 
-        correct_unrestricted += (preds_unrestricted == y_batch).sum().item()
-        correct_restricted += (preds_restricted == y_batch).sum().item()
+        # Global Accuracy Counts
+        correct_u += (preds_u == y_batch).sum().item()
+        correct_r += (preds_r == y_batch).sum().item()
         total += y_batch.size(0)
 
-acc_u = 100 * correct_unrestricted / total
-acc_r = 100 * correct_restricted / total
-print(f"Unrestricted (as-deployed) accuracy: {acc_u:.2f}%")
-print(f"Restricted (AM-SSB masked, shared-class-only) accuracy: {acc_r:.2f}%")
-print(f"Gap caused purely by the AM-SSB attractor: {acc_r - acc_u:.2f} points")
+        # Dynamic Per-SNR Tracking
+        start = i * BATCH_SIZE
+        batch_snrs = snr_10b[start : start + y_batch.size(0)]
+
+        for j, snr in enumerate(batch_snrs):
+            snr = int(snr)
+            snr_total[snr] = snr_total.get(snr, 0) + 1
+            if preds_r[j].item() == y_batch[j].item():
+                snr_correct_r[snr] = snr_correct_r.get(snr, 0) + 1
+
+
+# ============================================================
+# Final Summary Output
+# ============================================================
+
+acc_u = 100.0 * correct_u / total
+acc_r = 100.0 * correct_r / total
+gap = acc_r - acc_u
+
+print("============================================================")
+print("HybridAMCNet + ComplexBN 2016.10b TEST")
+print("============================================================")
+print(f"Unrestricted accuracy:               {acc_u:.2f}%")
+print(f"Restricted (AM-SSB masked) accuracy: {acc_r:.2f}%")
+print(f"AM-SSB attractor gap:                {gap:.2f} points")
+
+print("\nRestricted accuracy per SNR:")
+for snr in sorted(snr_total.keys()):
+    acc = 100.0 * snr_correct_r.get(snr, 0) / snr_total[snr]
+    print(f"SNR {snr:4d} dB: {acc:.2f}%")
+
+print("\n--- For comparison ---")
+print(
+    f"HybridAMCNet+ComplexBN: "
+    f"restricted {acc_r:.2f}%, "
+    f"in-domain clean 61.33% "
+    f"(gap {61.33 - acc_r:.2f})"
+)
